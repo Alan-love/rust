@@ -1269,7 +1269,7 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
         // to avoid ICEs.
         for item in &regular_traits {
             let object_safety_violations =
-                tcx.global_tcx().astconv_object_safety_violations(item.trait_ref().def_id());
+                tcx.astconv_object_safety_violations(item.trait_ref().def_id());
             if !object_safety_violations.is_empty() {
                 tcx.report_object_safety_error(
                     span,
@@ -2150,15 +2150,6 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                 // the type of local variables. Both of these cases are
                 // handled specially and will not descend into this routine.
                 self.ty_infer(None, ast_ty.span)
-            }
-            hir::TyKind::CVarArgs(lt) => {
-                let va_list_did = match tcx.lang_items().va_list() {
-                    Some(did) => did,
-                    None => span_bug!(ast_ty.span,
-                                      "`va_list` lang item required for variadics"),
-                };
-                let region = self.ast_region_to_region(&lt, None);
-                tcx.type_of(va_list_did).subst(tcx, &[region.into()])
             }
             hir::TyKind::Err => {
                 tcx.types.err

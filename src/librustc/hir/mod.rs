@@ -1552,7 +1552,7 @@ pub enum ExprKind {
     /// Thus, `x.foo::<Bar, Baz>(a, b, c, d)` is represented as
     /// `ExprKind::MethodCall(PathSegment { foo, [Bar, Baz] }, [x, a, b, c, d])`.
     MethodCall(P<PathSegment>, Span, HirVec<Expr>),
-    /// A tuple (e.g., `(a, b, c ,d)`).
+    /// A tuple (e.g., `(a, b, c, d)`).
     Tup(HirVec<Expr>),
     /// A binary operation (e.g., `a + b`, `a * b`).
     Binary(BinOp, P<Expr>, P<Expr>),
@@ -2016,9 +2016,6 @@ pub enum TyKind {
     Infer,
     /// Placeholder for a type that has failed to be defined.
     Err,
-    /// Placeholder for C-variadic arguments. We "spoof" the `VaListImpl` created
-    /// from the variadic arguments. This type is only valid up to typeck.
-    CVarArgs(Lifetime),
 }
 
 #[derive(Copy, Clone, RustcEncodable, RustcDecodable, Debug, HashStable)]

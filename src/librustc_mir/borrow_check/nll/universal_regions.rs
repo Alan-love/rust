@@ -72,6 +72,8 @@ pub struct UniversalRegions<'tcx> {
     pub unnormalized_input_tys: &'tcx [Ty<'tcx>],
 
     pub yield_ty: Option<Ty<'tcx>>,
+
+    pub c_variadic: bool,
 }
 
 /// The "defining type" for this MIR. The key feature of the "defining
@@ -451,6 +453,13 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
             _ => None,
         };
 
+        let c_variadic = match defining_ty {
+            DefiningTy::FnDef(def_id, _) => {
+                self.infcx.tcx.fn_sig(def_id).c_variadic()
+            }
+            _ => false,
+        };
+
         UniversalRegions {
             indices,
             fr_static,
@@ -462,6 +471,7 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
             unnormalized_output_ty,
             unnormalized_input_tys,
             yield_ty: yield_ty,
+            c_variadic,
         }
     }
 
@@ -521,9 +531,8 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
         defining_ty: DefiningTy<'tcx>,
     ) -> UniversalRegionIndices<'tcx> {
         let tcx = self.infcx.tcx;
-        let gcx = tcx.global_tcx();
         let closure_base_def_id = tcx.closure_base_def_id(self.mir_def_id);
-        let identity_substs = InternalSubsts::identity_for_item(gcx, closure_base_def_id);
+        let identity_substs = InternalSubsts::identity_for_item(tcx, closure_base_def_id);
         let fr_substs = match defining_ty {
             DefiningTy::Closure(_, ClosureSubsts { ref substs })
             | DefiningTy::Generator(_, GeneratorSubsts { ref substs }, _) => {
@@ -542,7 +551,7 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
             DefiningTy::FnDef(_, substs) | DefiningTy::Const(_, substs) => substs,
         };
 
-        let global_mapping = iter::once((gcx.lifetimes.re_static, fr_static));
+        let global_mapping = iter::once((tcx.lifetimes.re_static, fr_static));
         let subst_mapping = identity_substs
             .regions()
             .zip(fr_substs.regions().map(|r| r.to_region_vid()));
