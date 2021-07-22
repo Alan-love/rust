@@ -1,6 +1,6 @@
 use crate::cfg_eval::cfg_eval;
 
-use rustc_ast::{self as ast, token, ItemKind, MetaItemKind, NestedMetaItem, StmtKind};
+use rustc_ast::{self as ast, attr, token, ItemKind, MetaItemKind, NestedMetaItem, StmtKind};
 use rustc_errors::{struct_span_err, Applicability};
 use rustc_expand::base::{Annotatable, ExpandResult, ExtCtxt, Indeterminate, MultiItemModifier};
 use rustc_feature::AttributeTemplate;
@@ -26,33 +26,42 @@ impl MultiItemModifier for Expander {
             return ExpandResult::Ready(vec![item]);
         }
 
-        let template =
-            AttributeTemplate { list: Some("Trait1, Trait2, ..."), ..Default::default() };
-        let attr = ecx.attribute(meta_item.clone());
-        validate_attr::check_builtin_attribute(&sess.parse_sess, &attr, sym::derive, template);
+        let item = cfg_eval(ecx, item);
 
-        let derives: Vec<_> = attr
-            .meta_item_list()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|nested_meta| match nested_meta {
-                NestedMetaItem::MetaItem(meta) => Some(meta),
-                NestedMetaItem::Literal(lit) => {
-                    // Reject `#[derive("Debug")]`.
-                    report_unexpected_literal(sess, &lit);
-                    None
-                }
-            })
-            .map(|meta| {
-                // Reject `#[derive(Debug = "value", Debug(abc))]`, but recover the paths.
-                report_path_args(sess, &meta);
-                meta.path
-            })
-            .collect();
+        let result =
+            ecx.resolver.resolve_derives(ecx.current_expansion.id, ecx.force_mode, &|| {
+                let template =
+                    AttributeTemplate { list: Some("Trait1, Trait2, ..."), ..Default::default() };
+                let attr = attr::mk_attr_outer(meta_item.clone());
+                validate_attr::check_builtin_attribute(
+                    &sess.parse_sess,
+                    &attr,
+                    sym::derive,
+                    template,
+                );
 
-        // FIXME: Try to cache intermediate results to avoid collecting same paths multiple times.
-        match ecx.resolver.resolve_derives(ecx.current_expansion.id, derives, ecx.force_mode) {
-            Ok(()) => ExpandResult::Ready(cfg_eval(ecx, item)),
+                attr.meta_item_list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|nested_meta| match nested_meta {
+                        NestedMetaItem::MetaItem(meta) => Some(meta),
+                        NestedMetaItem::Literal(lit) => {
+                            // Reject `#[derive("Debug")]`.
+                            report_unexpected_literal(sess, &lit);
+                            None
+                        }
+                    })
+                    .map(|meta| {
+                        // Reject `#[derive(Debug = "value", Debug(abc))]`, but recover the paths.
+                        report_path_args(sess, &meta);
+                        meta.path
+                    })
+                    .map(|path| (path, item.clone(), None))
+                    .collect()
+            });
+
+        match result {
+            Ok(()) => ExpandResult::Ready(vec![item]),
             Err(Indeterminate) => ExpandResult::Retry(item),
         }
     }
@@ -75,8 +84,10 @@ fn report_bad_target(sess: &Session, item: &Annotatable, span: Span) -> bool {
             sess,
             span,
             E0774,
-            "`derive` may only be applied to structs, enums and unions",
+            "`derive` may only be applied to `struct`s, `enum`s and `union`s",
         )
+        .span_label(span, "not applicable here")
+        .span_label(item.span(), "not a `struct`, `enum` or `union`")
         .emit();
     }
     bad_target
@@ -90,6 +101,7 @@ fn report_unexpected_literal(sess: &Session, lit: &ast::Lit) {
         _ => "for example, write `#[derive(Debug)]` for `Debug`".to_string(),
     };
     struct_span_err!(sess, lit.span, E0777, "expected path to a trait, found literal",)
+        .span_label(lit.span, "not a trait")
         .help(&help_msg)
         .emit();
 }

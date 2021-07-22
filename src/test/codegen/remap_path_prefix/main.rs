@@ -1,5 +1,5 @@
 // ignore-windows
-// ignore-tidy-linelength
+//
 
 // compile-flags: -g  -C no-prepopulate-passes --remap-path-prefix={{cwd}}=/the/cwd --remap-path-prefix={{src-base}}=/the/src
 // aux-build:remap_path_prefix_aux.rs
@@ -12,7 +12,7 @@ mod aux_mod;
 include!("aux_mod.rs");
 
 // Here we check that the expansion of the file!() macro is mapped.
-// CHECK: @alloc1 = private unnamed_addr constant <{ [34 x i8] }> <{ [34 x i8] c"/the/src/remap_path_prefix/main.rs" }>, align 1
+// CHECK: @alloc2 = private unnamed_addr constant <{ [34 x i8] }> <{ [34 x i8] c"/the/src/remap_path_prefix/main.rs" }>, align 1
 pub static FILE_PATH: &'static str = file!();
 
 fn main() {

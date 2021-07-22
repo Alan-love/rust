@@ -128,6 +128,7 @@ impl Step for Llvm {
                 Err(m) => m,
             };
 
+        builder.update_submodule(&Path::new("src").join("llvm-project"));
         if builder.config.llvm_link_shared
             && (target.contains("windows") || target.contains("apple-darwin"))
         {
@@ -139,7 +140,7 @@ impl Step for Llvm {
         let _time = util::timeit(&builder);
         t!(fs::create_dir_all(&out_dir));
 
-        // http://llvm.org/docs/CMake.html
+        // https://llvm.org/docs/CMake.html
         let mut cfg = cmake::Config::new(builder.src.join(root));
 
         let profile = match (builder.config.llvm_optimize, builder.config.llvm_release_debuginfo) {
@@ -153,7 +154,7 @@ impl Step for Llvm {
         let llvm_targets = match &builder.config.llvm_targets {
             Some(s) => s,
             None => {
-                "AArch64;ARM;Hexagon;MSP430;Mips;NVPTX;PowerPC;RISCV;\
+                "AArch64;ARM;BPF;Hexagon;MSP430;Mips;NVPTX;PowerPC;RISCV;\
                      Sparc;SystemZ;WebAssembly;X86"
             }
         };
@@ -181,7 +182,7 @@ impl Step for Llvm {
             .define("LLVM_TARGET_ARCH", target_native.split('-').next().unwrap())
             .define("LLVM_DEFAULT_TARGET_TRIPLE", target_native);
 
-        if target != "aarch64-apple-darwin" {
+        if target != "aarch64-apple-darwin" && !target.contains("windows") {
             cfg.define("LLVM_ENABLE_ZLIB", "ON");
         } else {
             cfg.define("LLVM_ENABLE_ZLIB", "OFF");
@@ -256,7 +257,7 @@ impl Step for Llvm {
             enabled_llvm_projects.push("compiler-rt");
         }
 
-        if let Some(true) = builder.config.llvm_polly {
+        if builder.config.llvm_polly {
             enabled_llvm_projects.push("polly");
         }
 
@@ -276,7 +277,7 @@ impl Step for Llvm {
             }
         }
 
-        // http://llvm.org/docs/HowToCrossCompileLLVM.html
+        // https://llvm.org/docs/HowToCrossCompileLLVM.html
         if target != builder.config.build {
             builder.ensure(Llvm { target: builder.config.build });
             // FIXME: if the llvm root for the build triple is overridden then we
@@ -311,7 +312,7 @@ impl Step for Llvm {
             cfg.define("LLVM_USE_LINKER", linker);
         }
 
-        if let Some(true) = builder.config.llvm_allow_old_toolchain {
+        if builder.config.llvm_allow_old_toolchain {
             cfg.define("LLVM_TEMPORARILY_ALLOW_OLD_TOOLCHAIN", "YES");
         }
 
@@ -347,11 +348,11 @@ fn check_llvm_version(builder: &Builder<'_>, llvm_config: &Path) {
     let version = output(cmd.arg("--version"));
     let mut parts = version.split('.').take(2).filter_map(|s| s.parse::<u32>().ok());
     if let (Some(major), Some(_minor)) = (parts.next(), parts.next()) {
-        if major >= 9 {
+        if major >= 10 {
             return;
         }
     }
-    panic!("\n\nbad LLVM version: {}, need >=9.0\n\n", version)
+    panic!("\n\nbad LLVM version: {}, need >=10.0\n\n", version)
 }
 
 fn configure_cmake(
@@ -814,6 +815,9 @@ fn supported_sanitizers(
         "x86_64-unknown-linux-gnu" => {
             common_libs("linux", "x86_64", &["asan", "lsan", "msan", "tsan"])
         }
+        "x86_64-unknown-linux-musl" => {
+            common_libs("linux", "x86_64", &["asan", "lsan", "msan", "tsan"])
+        }
         _ => Vec::new(),
     }
 }
@@ -853,5 +857,71 @@ impl HashStamp {
 
     fn write(&self) -> io::Result<()> {
         fs::write(&self.path, self.hash.as_deref().unwrap_or(b""))
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct CrtBeginEnd {
+    pub target: TargetSelection,
+}
+
+impl Step for CrtBeginEnd {
+    type Output = PathBuf;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.path("src/llvm-project/compiler-rt/lib/crt")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(CrtBeginEnd { target: run.target });
+    }
+
+    /// Build crtbegin.o/crtend.o for musl target.
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
+        let out_dir = builder.native_dir(self.target).join("crt");
+
+        if builder.config.dry_run {
+            return out_dir;
+        }
+
+        let crtbegin_src = builder.src.join("src/llvm-project/compiler-rt/lib/crt/crtbegin.c");
+        let crtend_src = builder.src.join("src/llvm-project/compiler-rt/lib/crt/crtend.c");
+        if up_to_date(&crtbegin_src, &out_dir.join("crtbegin.o"))
+            && up_to_date(&crtend_src, &out_dir.join("crtendS.o"))
+        {
+            return out_dir;
+        }
+
+        builder.info("Building crtbegin.o and crtend.o");
+        t!(fs::create_dir_all(&out_dir));
+
+        let mut cfg = cc::Build::new();
+
+        if let Some(ar) = builder.ar(self.target) {
+            cfg.archiver(ar);
+        }
+        cfg.compiler(builder.cc(self.target));
+        cfg.cargo_metadata(false)
+            .out_dir(&out_dir)
+            .target(&self.target.triple)
+            .host(&builder.config.build.triple)
+            .warnings(false)
+            .debug(false)
+            .opt_level(3)
+            .file(crtbegin_src)
+            .file(crtend_src);
+
+        // Those flags are defined in src/llvm-project/compiler-rt/lib/crt/CMakeLists.txt
+        // Currently only consumer of those objects is musl, which use .init_array/.fini_array
+        // instead of .ctors/.dtors
+        cfg.flag("-std=c11")
+            .define("CRT_HAS_INITFINI_ARRAY", None)
+            .define("EH_USE_FRAME_REGISTRY", None);
+
+        cfg.compile("crt");
+
+        t!(fs::copy(out_dir.join("crtbegin.o"), out_dir.join("crtbeginS.o")));
+        t!(fs::copy(out_dir.join("crtend.o"), out_dir.join("crtendS.o")));
+        out_dir
     }
 }

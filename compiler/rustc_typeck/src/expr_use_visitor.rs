@@ -2,8 +2,6 @@
 //! normal visitor, which just walks the entire body in one shot, the
 //! `ExprUseVisitor` determines how expressions are being used.
 
-pub use self::ConsumeMode::*;
-
 // Export these here so that Clippy can use them.
 pub use rustc_middle::hir::place::{Place, PlaceBase, PlaceWithHirId, Projection};
 
@@ -18,6 +16,7 @@ use rustc_middle::hir::place::ProjectionKind;
 use rustc_middle::mir::FakeReadCause;
 use rustc_middle::ty::{self, adjustment, TyCtxt};
 use rustc_target::abi::VariantIdx;
+use std::iter;
 
 use crate::mem_categorization as mc;
 
@@ -27,19 +26,20 @@ use crate::mem_categorization as mc;
 /// This trait defines the callbacks you can expect to receive when
 /// employing the ExprUseVisitor.
 pub trait Delegate<'tcx> {
-    // The value found at `place` is either copied or moved, depending
+    // The value found at `place` is moved, depending
     // on `mode`. Where `diag_expr_id` is the id used for diagnostics for `place`.
+    //
+    // Use of a `Copy` type in a ByValue context is considered a use
+    // by `ImmBorrow` and `borrow` is called instead. This is because
+    // a shared borrow is the "minimum access" that would be needed
+    // to perform a copy.
+    //
     //
     // The parameter `diag_expr_id` indicates the HIR id that ought to be used for
     // diagnostics. Around pattern matching such as `let pat = expr`, the diagnostic
     // id will be the id of the expression `expr` but the place itself will have
     // the id of the binding in the pattern `pat`.
-    fn consume(
-        &mut self,
-        place_with_id: &PlaceWithHirId<'tcx>,
-        diag_expr_id: hir::HirId,
-        mode: ConsumeMode,
-    );
+    fn consume(&mut self, place_with_id: &PlaceWithHirId<'tcx>, diag_expr_id: hir::HirId);
 
     // The value found at `place` is being borrowed with kind `bk`.
     // `diag_expr_id` is the id used for diagnostics (see `consume` for more details).
@@ -59,7 +59,7 @@ pub trait Delegate<'tcx> {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
-pub enum ConsumeMode {
+enum ConsumeMode {
     Copy, // reference to x where x has a type that copies
     Move, // reference to x where x has a type that moves
 }
@@ -140,10 +140,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
     }
 
     fn delegate_consume(&mut self, place_with_id: &PlaceWithHirId<'tcx>, diag_expr_id: hir::HirId) {
-        debug!("delegate_consume(place_with_id={:?})", place_with_id);
-
-        let mode = copy_or_move(&self.mc, place_with_id);
-        self.delegate.consume(place_with_id, diag_expr_id, mode);
+        delegate_consume(&self.mc, self.delegate, place_with_id, diag_expr_id)
     }
 
     fn consume_exprs(&mut self, exprs: &[hir::Expr<'_>]) {
@@ -255,12 +252,16 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                             | PatKind::Path(..)
                             | PatKind::Struct(..)
                             | PatKind::Tuple(..) => {
-                                // If the PatKind is a TupleStruct, Struct or Tuple then we want to check
+                                // If the PatKind is a TupleStruct, Path, Struct or Tuple then we want to check
                                 // whether the Variant is a MultiVariant or a SingleVariant. We only want
                                 // to borrow discr if it is a MultiVariant.
                                 // If it is a SingleVariant and creates a binding we will handle that when
                                 // this callback gets called again.
-                                if let ty::Adt(def, _) = place.place.base_ty.kind() {
+
+                                // Get the type of the Place after all projections have been applied
+                                let place_ty = place.place.ty();
+
+                                if let ty::Adt(def, _) = place_ty.kind() {
                                     if def.variants.len() > 1 {
                                         needs_to_be_read = true;
                                     }
@@ -279,9 +280,14 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                 if needs_to_be_read {
                     self.borrow_expr(&discr, ty::ImmBorrow);
                 } else {
+                    let closure_def_id = match discr_place.place.base {
+                        PlaceBase::Upvar(upvar_id) => Some(upvar_id.closure_expr_id.to_def_id()),
+                        _ => None,
+                    };
+
                     self.delegate.fake_read(
                         discr_place.place.clone(),
-                        FakeReadCause::ForMatchedPlace,
+                        FakeReadCause::ForMatchedPlace(closure_def_id),
                         discr_place.hir_id,
                     );
 
@@ -312,7 +318,6 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                 for (op, _op_sp) in asm.operands {
                     match op {
                         hir::InlineAsmOperand::In { expr, .. }
-                        | hir::InlineAsmOperand::Const { expr, .. }
                         | hir::InlineAsmOperand::Sym { expr, .. } => self.consume_expr(expr),
                         hir::InlineAsmOperand::Out { expr, .. } => {
                             if let Some(expr) = expr {
@@ -328,12 +333,13 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                                 self.mutate_expr(out_expr);
                             }
                         }
+                        hir::InlineAsmOperand::Const { .. } => {}
                     }
                 }
             }
 
             hir::ExprKind::LlvmInlineAsm(ref ia) => {
-                for (o, output) in ia.inner.outputs.iter().zip(ia.outputs_exprs) {
+                for (o, output) in iter::zip(&ia.inner.outputs, ia.outputs_exprs) {
                     if o.is_indirect {
                         self.consume_expr(output);
                     } else {
@@ -577,9 +583,14 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
     }
 
     fn walk_arm(&mut self, discr_place: &PlaceWithHirId<'tcx>, arm: &hir::Arm<'_>) {
+        let closure_def_id = match discr_place.place.base {
+            PlaceBase::Upvar(upvar_id) => Some(upvar_id.closure_expr_id.to_def_id()),
+            _ => None,
+        };
+
         self.delegate.fake_read(
             discr_place.place.clone(),
-            FakeReadCause::ForMatchedPlace,
+            FakeReadCause::ForMatchedPlace(closure_def_id),
             discr_place.hir_id,
         );
         self.walk_pat(discr_place, &arm.pat);
@@ -594,9 +605,14 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
     /// Walks a pat that occurs in isolation (i.e., top-level of fn argument or
     /// let binding, and *not* a match arm or nested pat.)
     fn walk_irrefutable_pat(&mut self, discr_place: &PlaceWithHirId<'tcx>, pat: &hir::Pat<'_>) {
+        let closure_def_id = match discr_place.place.base {
+            PlaceBase::Upvar(upvar_id) => Some(upvar_id.closure_expr_id.to_def_id()),
+            _ => None,
+        };
+
         self.delegate.fake_read(
             discr_place.place.clone(),
-            FakeReadCause::ForLet,
+            FakeReadCause::ForLet(closure_def_id),
             discr_place.hir_id,
         );
         self.walk_pat(discr_place, pat);
@@ -637,9 +653,8 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                             delegate.borrow(place, discr_place.hir_id, bk);
                         }
                         ty::BindByValue(..) => {
-                            let mode = copy_or_move(mc, &place);
                             debug!("walk_pat binding consuming pat");
-                            delegate.consume(place, discr_place.hir_id, mode);
+                            delegate_consume(mc, *delegate, place, discr_place.hir_id);
                         }
                     }
                 }
@@ -655,7 +670,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
     /// In the following example the closures `c` only captures `p.x`` even though `incr`
     /// is a capture of the nested closure
     ///
-    /// ```rust,ignore(cannot-test-this-because-pseduo-code)
+    /// ```rust,ignore(cannot-test-this-because-pseudo-code)
     /// let p = ..;
     /// let c = || {
     ///    let incr = 10;
@@ -699,7 +714,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                             // The only places we want to fake read before creating the parent closure are the ones that
                             // are not local to it/ defined by it.
                             //
-                            // ```rust,ignore(cannot-test-this-because-pseduo-code)
+                            // ```rust,ignore(cannot-test-this-because-pseudo-code)
                             // let v1 = (0, 1);
                             // let c = || { // fake reads: v1
                             //    let v2 = (0, 1);
@@ -747,7 +762,9 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                         PlaceBase::Local(*var_hir_id)
                     };
                     let place_with_id = PlaceWithHirId::new(
-                        capture_info.path_expr_id.unwrap_or(closure_expr.hir_id),
+                        capture_info.path_expr_id.unwrap_or(
+                            capture_info.capture_kind_expr_id.unwrap_or(closure_expr.hir_id),
+                        ),
                         place.base_ty,
                         place_base,
                         place.projections.clone(),
@@ -755,8 +772,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
 
                     match capture_info.capture_kind {
                         ty::UpvarCapture::ByValue(_) => {
-                            let mode = copy_or_move(&self.mc, &place_with_id);
-                            self.delegate.consume(&place_with_id, place_with_id.hir_id, mode);
+                            self.delegate_consume(&place_with_id, place_with_id.hir_id);
                         }
                         ty::UpvarCapture::ByRef(upvar_borrow) => {
                             self.delegate.borrow(
@@ -780,8 +796,28 @@ fn copy_or_move<'a, 'tcx>(
         place_with_id.place.ty(),
         mc.tcx().hir().span(place_with_id.hir_id),
     ) {
-        Move
+        ConsumeMode::Move
     } else {
-        Copy
+        ConsumeMode::Copy
+    }
+}
+
+// - If a place is used in a `ByValue` context then move it if it's not a `Copy` type.
+// - If the place that is a `Copy` type consider it a `ImmBorrow`.
+fn delegate_consume<'a, 'tcx>(
+    mc: &mc::MemCategorizationContext<'a, 'tcx>,
+    delegate: &mut (dyn Delegate<'tcx> + 'a),
+    place_with_id: &PlaceWithHirId<'tcx>,
+    diag_expr_id: hir::HirId,
+) {
+    debug!("delegate_consume(place_with_id={:?})", place_with_id);
+
+    let mode = copy_or_move(&mc, place_with_id);
+
+    match mode {
+        ConsumeMode::Move => delegate.consume(place_with_id, diag_expr_id),
+        ConsumeMode::Copy => {
+            delegate.borrow(place_with_id, diag_expr_id, ty::BorrowKind::ImmBorrow)
+        }
     }
 }

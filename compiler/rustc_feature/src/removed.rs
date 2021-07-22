@@ -80,6 +80,11 @@ declare_features! (
      Some("subsumed by `#![feature(allocator_internals)]`")),
     /// Allows identifying crates that contain sanitizer runtimes.
     (removed, sanitizer_runtime, "1.17.0", None, None, None),
+    /// Allows `#[doc(spotlight)]`.
+    /// The attribute was renamed to `#[doc(notable_trait)]`
+    /// and the feature to `doc_notable_trait`.
+    (removed, doc_spotlight, "1.22.0", Some(45040), None,
+     Some("renamed to `doc_notable_trait`")),
     (removed, proc_macro_mod, "1.27.0", Some(54727), None,
      Some("subsumed by `#![feature(proc_macro_hygiene)]`")),
     (removed, proc_macro_expr, "1.27.0", Some(54727), None,
@@ -123,6 +128,29 @@ declare_features! (
     /// Allows comparing raw pointers during const eval.
     (removed, const_compare_raw_pointers, "1.46.0", Some(53020), None,
      Some("cannot be allowed in const eval in any meaningful way")),
+    /// Allows using the `#[link_args]` attribute.
+    (removed, link_args, "1.53.0", Some(29596), None,
+     Some("removed in favor of using `-C link-arg=ARG` on command line, \
+           which is available from cargo build scripts with `cargo:rustc-link-arg` now")),
+    /// Allows using `#[main]` to replace the entrypoint `#[lang = "start"]` calls.
+    (removed, main, "1.53.0", Some(29634), None, None),
+    (removed, pub_macro_rules, "1.53.0", Some(78855), None,
+     Some("removed due to being incomplete, in particular it does not work across crates")),
+     /// Allows the definition of `const` functions with some advanced features.
+    (removed, const_fn, "1.54.0", Some(57563), None,
+     Some("split into finer-grained feature gates")),
+
+    /// Allows `#[doc(include = "some-file")]`.
+    (removed, external_doc, "1.54.0", Some(44732), None,
+     Some("use #[doc = include_str!(\"filename\")] instead, which handles macro invocations")),
+
+     /// Allows casting raw pointers to `usize` during const eval.
+    (removed, const_raw_ptr_to_usize_cast, "1.55.0", Some(51910), None,
+     Some("at compile-time, pointers do not have an integer value, so these casts cannot be properly supported")),
+
+    /// Allows `impl Trait` in bindings (`let`, `const`, `static`).
+    (removed, impl_trait_in_bindings, "1.55.0", Some(63065), None,
+     Some("the implementation was not maintainable, the feature may get reintroduced once the current refactorings are done")),
 
     // -------------------------------------------------------------------------
     // feature-group-end: removed features

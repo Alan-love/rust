@@ -8,7 +8,7 @@ use rustc_ast::tokenstream::{DelimSpan, TokenStream, TokenTree, TreeAndSpacing};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{pluralize, PResult};
-use rustc_span::hygiene::{ExpnId, Transparency};
+use rustc_span::hygiene::{LocalExpnId, Transparency};
 use rustc_span::symbol::MacroRulesNormalizedIdent;
 use rustc_span::Span;
 
@@ -16,7 +16,7 @@ use smallvec::{smallvec, SmallVec};
 use std::mem;
 
 // A Marker adds the given mark to the syntax context.
-struct Marker(ExpnId, Transparency);
+struct Marker(LocalExpnId, Transparency);
 
 impl MutVisitor for Marker {
     fn token_visiting_enabled(&self) -> bool {
@@ -24,7 +24,7 @@ impl MutVisitor for Marker {
     }
 
     fn visit_span(&mut self, span: &mut Span) {
-        *span = span.apply_mark(self.0, self.1)
+        *span = span.apply_mark(self.0.to_expn_id(), self.1)
     }
 }
 
@@ -209,7 +209,7 @@ pub(super) fn transcribe<'a>(
                             }
                         } else {
                             // 0 is the initial counter (we have done 0 repretitions so far). `len`
-                            // is the total number of reptitions we should generate.
+                            // is the total number of repetitions we should generate.
                             repeats.push((0, len));
 
                             // The first time we encounter the sequence we push it to the stack. It
@@ -362,7 +362,7 @@ impl LockstepIterSize {
 /// appropriate meta-vars in `interpolations`.
 ///
 /// Note that if `repeats` does not match the exact correct depth of a meta-var,
-/// `lookup_cur_matched` will return `None`, which is why this still works even in the presnece of
+/// `lookup_cur_matched` will return `None`, which is why this still works even in the presence of
 /// multiple nested matcher sequences.
 fn lockstep_iter_size(
     tree: &mbe::TokenTree,

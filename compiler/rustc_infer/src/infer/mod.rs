@@ -18,7 +18,6 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::infer::canonical::{Canonical, CanonicalVarValues};
 use rustc_middle::infer::unify_key::{ConstVarValue, ConstVariableValue};
 use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind, ToType};
-use rustc_middle::mir;
 use rustc_middle::mir::interpret::EvalToConstValueResult;
 use rustc_middle::traits::select;
 use rustc_middle::ty::error::{ExpectedFound, TypeError, UnconstrainedNumeric};
@@ -454,8 +453,6 @@ pub enum RegionVariableOrigin {
 
     UpvarRegion(ty::UpvarId, Span),
 
-    BoundRegionInCoherence(Symbol),
-
     /// This origin is used for the inference variables that we create
     /// during NLL region processing.
     Nll(NllRegionVariableOrigin),
@@ -649,7 +646,12 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     }
 
     pub fn freshener<'b>(&'b self) -> TypeFreshener<'b, 'tcx> {
-        freshen::TypeFreshener::new(self)
+        freshen::TypeFreshener::new(self, false)
+    }
+
+    /// Like `freshener`, but does not replace `'static` regions.
+    pub fn freshener_keep_static<'b>(&'b self) -> TypeFreshener<'b, 'tcx> {
+        freshen::TypeFreshener::new(self, true)
     }
 
     pub fn type_is_unconstrained_numeric(&'a self, ty: Ty<'_>) -> UnconstrainedNumeric {
@@ -1267,15 +1269,6 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         self.resolve_vars_if_possible(t).to_string()
     }
 
-    pub fn tys_to_string(&self, ts: &[Ty<'tcx>]) -> String {
-        let tstrs: Vec<String> = ts.iter().map(|t| self.ty_to_string(*t)).collect();
-        format!("({})", tstrs.join(", "))
-    }
-
-    pub fn trait_ref_to_string(&self, t: ty::TraitRef<'tcx>) -> String {
-        self.resolve_vars_if_possible(t).print_only_trait_path().to_string()
-    }
-
     /// If `TyVar(vid)` resolves to a type, return that type. Else, return the
     /// universe index of `TyVar(vid)`.
     pub fn probe_ty_var(&self, vid: TyVid) -> Result<Ty<'tcx>, ty::UniverseIndex> {
@@ -1416,7 +1409,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         &self,
         span: Span,
         lbrct: LateBoundRegionConversionTime,
-        value: ty::Binder<T>,
+        value: ty::Binder<'tcx, T>,
     ) -> (T, BTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
     where
         T: TypeFoldable<'tcx>,
@@ -1499,9 +1492,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     pub fn const_eval_resolve(
         &self,
         param_env: ty::ParamEnv<'tcx>,
-        def: ty::WithOptConstParam<DefId>,
-        substs: SubstsRef<'tcx>,
-        promoted: Option<mir::Promoted>,
+        ty::Unevaluated { def, substs, promoted }: ty::Unevaluated<'tcx>,
         span: Option<Span>,
     ) -> EvalToConstValueResult<'tcx> {
         let mut original_values = OriginalQueryValues::default();
@@ -1510,7 +1501,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         let (param_env, substs) = canonical.value;
         // The return value is the evaluated value which doesn't contain any reference to inference
         // variables, thus we don't need to substitute back the original values.
-        self.tcx.const_eval_resolve(param_env, def, substs, promoted, span)
+        self.tcx.const_eval_resolve(param_env, ty::Unevaluated { def, substs, promoted }, span)
     }
 
     /// If `typ` is a type variable of some kind, resolve it one level
@@ -1707,14 +1698,6 @@ impl<'tcx> TypeTrace<'tcx> {
     ) -> TypeTrace<'tcx> {
         TypeTrace { cause: cause.clone(), values: Consts(ExpectedFound::new(a_is_expected, a, b)) }
     }
-
-    pub fn dummy(tcx: TyCtxt<'tcx>) -> TypeTrace<'tcx> {
-        let err = tcx.ty_error();
-        TypeTrace {
-            cause: ObligationCause::dummy(),
-            values: Types(ExpectedFound { expected: err, found: err }),
-        }
-    }
 }
 
 impl<'tcx> SubregionOrigin<'tcx> {
@@ -1769,7 +1752,6 @@ impl RegionVariableOrigin {
             | EarlyBoundRegion(a, ..)
             | LateBoundRegion(a, ..)
             | UpvarRegion(_, a) => a,
-            BoundRegionInCoherence(_) => rustc_span::DUMMY_SP,
             Nll(..) => bug!("NLL variable used with `span`"),
         }
     }

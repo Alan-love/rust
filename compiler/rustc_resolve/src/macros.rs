@@ -4,7 +4,7 @@
 use crate::imports::ImportResolver;
 use crate::Namespace::*;
 use crate::{AmbiguityError, AmbiguityErrorMisc, AmbiguityKind, BuiltinMacroState, Determinacy};
-use crate::{CrateLint, ParentScope, ResolutionError, Resolver, Scope, ScopeSet, Weak};
+use crate::{CrateLint, DeriveData, ParentScope, ResolutionError, Resolver, Scope, ScopeSet, Weak};
 use crate::{ModuleKind, ModuleOrUniformRoot, NameBinding, PathResult, Segment, ToNameBinding};
 use rustc_ast::{self as ast, Inline, ItemKind, ModKind, NodeId};
 use rustc_ast_lowering::ResolverAstLowering;
@@ -14,22 +14,23 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::ptr_key::PtrKey;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::struct_span_err;
-use rustc_expand::base::Annotatable;
-use rustc_expand::base::{Indeterminate, ResolverExpand, SyntaxExtension, SyntaxExtensionKind};
+use rustc_expand::base::{Annotatable, DeriveResolutions, Indeterminate, ResolverExpand};
+use rustc_expand::base::{SyntaxExtension, SyntaxExtensionKind};
 use rustc_expand::compile_declarative_macro;
-use rustc_expand::expand::{AstFragment, Invocation, InvocationKind};
+use rustc_expand::expand::{AstFragment, Invocation, InvocationKind, SupportsMacroExpansion};
 use rustc_feature::is_builtin_attr_name;
 use rustc_hir::def::{self, DefKind, NonMacroAttrKind};
-use rustc_hir::def_id;
+use rustc_hir::def_id::{CrateNum, LocalDefId};
 use rustc_hir::PrimTy;
 use rustc_middle::middle::stability;
 use rustc_middle::ty;
-use rustc_session::lint::builtin::{LEGACY_DERIVE_HELPERS, SOFT_UNSTABLE, UNUSED_MACROS};
+use rustc_session::lint::builtin::{LEGACY_DERIVE_HELPERS, PROC_MACRO_DERIVE_RESOLUTION_FALLBACK};
+use rustc_session::lint::builtin::{SOFT_UNSTABLE, UNUSED_MACROS};
 use rustc_session::lint::BuiltinLintDiagnostics;
 use rustc_session::parse::feature_err;
 use rustc_session::Session;
 use rustc_span::edition::Edition;
-use rustc_span::hygiene::{self, ExpnData, ExpnId, ExpnKind};
+use rustc_span::hygiene::{self, ExpnData, ExpnKind, LocalExpnId};
 use rustc_span::hygiene::{AstPass, MacroKind};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
@@ -61,7 +62,7 @@ pub enum MacroRulesScope<'a> {
     Binding(&'a MacroRulesBinding<'a>),
     /// The scope introduced by a macro invocation that can potentially
     /// create a `macro_rules!` macro definition.
-    Invocation(ExpnId),
+    Invocation(LocalExpnId),
 }
 
 /// `macro_rules!` scopes are always kept by reference and inside a cell.
@@ -189,7 +190,11 @@ impl<'a> ResolverExpand for Resolver<'a> {
         });
     }
 
-    fn visit_ast_fragment_with_placeholders(&mut self, expansion: ExpnId, fragment: &AstFragment) {
+    fn visit_ast_fragment_with_placeholders(
+        &mut self,
+        expansion: LocalExpnId,
+        fragment: &AstFragment,
+    ) {
         // Integrate the new AST fragment into all the definition and module structures.
         // We are inside the `expansion` now, but other parent scope components are still the same.
         let parent_scope = ParentScope { expansion, ..self.invocation_parent_scopes[&expansion] };
@@ -215,27 +220,24 @@ impl<'a> ResolverExpand for Resolver<'a> {
         pass: AstPass,
         features: &[Symbol],
         parent_module_id: Option<NodeId>,
-    ) -> ExpnId {
-        let expn_id = ExpnId::fresh(Some(ExpnData::allow_unstable(
-            ExpnKind::AstPass(pass),
-            call_site,
-            self.session.edition(),
-            features.into(),
-            None,
-        )));
+    ) -> LocalExpnId {
+        let parent_module = parent_module_id.map(|module_id| self.local_def_id(module_id));
+        let expn_id = LocalExpnId::fresh(
+            ExpnData::allow_unstable(
+                ExpnKind::AstPass(pass),
+                call_site,
+                self.session.edition(),
+                features.into(),
+                None,
+                parent_module.map(LocalDefId::to_def_id),
+            ),
+            self.create_stable_hashing_context(),
+        );
 
-        let parent_scope = if let Some(module_id) = parent_module_id {
-            let parent_def_id = self.local_def_id(module_id);
-            self.definitions.add_parent_module_of_macro_def(expn_id, parent_def_id.to_def_id());
-            self.module_map[&parent_def_id]
-        } else {
-            self.definitions.add_parent_module_of_macro_def(
-                expn_id,
-                def_id::DefId::local(def_id::CRATE_DEF_INDEX),
-            );
-            self.empty_module
-        };
+        let parent_scope = parent_module
+            .map_or(self.empty_module, |parent_def_id| self.module_map[&parent_def_id]);
         self.ast_transform_scopes.insert(expn_id, parent_scope);
+
         expn_id
     }
 
@@ -246,7 +248,7 @@ impl<'a> ResolverExpand for Resolver<'a> {
     fn resolve_macro_invocation(
         &mut self,
         invoc: &Invocation,
-        eager_expansion_root: ExpnId,
+        eager_expansion_root: LocalExpnId,
         force: bool,
     ) -> Result<Lrc<SyntaxExtension>, Indeterminate> {
         let invoc_id = invoc.expansion_data.id;
@@ -278,12 +280,12 @@ impl<'a> ResolverExpand for Resolver<'a> {
 
         // Derives are not included when `invocations` are collected, so we have to add them here.
         let parent_scope = &ParentScope { derives, ..parent_scope };
-        let require_inert = !invoc.fragment_kind.supports_macro_expansion();
-        let node_id = self.lint_node_id(eager_expansion_root);
+        let supports_macro_expansion = invoc.fragment_kind.supports_macro_expansion();
+        let node_id = invoc.expansion_data.lint_node_id;
         let (ext, res) = self.smart_resolve_macro_path(
             path,
             kind,
-            require_inert,
+            supports_macro_expansion,
             inner_attr,
             parent_scope,
             node_id,
@@ -292,17 +294,20 @@ impl<'a> ResolverExpand for Resolver<'a> {
         )?;
 
         let span = invoc.span();
-        invoc_id.set_expn_data(ext.expn_data(
-            parent_scope.expansion,
-            span,
-            fast_print_path(path),
-            res.opt_def_id(),
-        ));
+        invoc_id.set_expn_data(
+            ext.expn_data(
+                parent_scope.expansion,
+                span,
+                fast_print_path(path),
+                res.opt_def_id(),
+                res.opt_def_id().map(|macro_def_id| {
+                    self.macro_def_scope_from_def_id(macro_def_id).nearest_parent_mod
+                }),
+            ),
+            self.create_stable_hashing_context(),
+        );
 
         if let Res::Def(_, _) = res {
-            let normal_module_def_id = self.macro_def_scope(invoc_id).nearest_parent_mod;
-            self.definitions.add_parent_module_of_macro_def(invoc_id, normal_module_def_id);
-
             // Gate macro attributes in `#[derive]` output.
             if !self.session.features_untracked().macro_attributes_in_derive_output
                 && kind == MacroKind::Attr
@@ -327,7 +332,7 @@ impl<'a> ResolverExpand for Resolver<'a> {
                             | ExpnKind::Macro(MacroKind::Bang | MacroKind::Derive, _) => {
                                 break;
                             }
-                            _ => expn_id = expn_data.parent,
+                            _ => expn_id = expn_data.parent.expect_local(),
                         }
                     }
                 }
@@ -343,23 +348,15 @@ impl<'a> ResolverExpand for Resolver<'a> {
         }
     }
 
-    fn lint_node_id(&self, expn_id: ExpnId) -> NodeId {
-        // FIXME - make this more precise. This currently returns the NodeId of the
-        // nearest closing item - we should try to return the closest parent of the ExpnId
-        self.invocation_parents
-            .get(&expn_id)
-            .map_or(ast::CRATE_NODE_ID, |id| self.def_id_to_node_id[id.0])
-    }
-
-    fn has_derive_copy(&self, expn_id: ExpnId) -> bool {
+    fn has_derive_copy(&self, expn_id: LocalExpnId) -> bool {
         self.containers_deriving_copy.contains(&expn_id)
     }
 
     fn resolve_derives(
         &mut self,
-        expn_id: ExpnId,
-        derives: Vec<ast::Path>,
+        expn_id: LocalExpnId,
         force: bool,
+        derive_paths: &dyn Fn() -> DeriveResolutions,
     ) -> Result<(), Indeterminate> {
         // Block expansion of the container until we resolve all derives in it.
         // This is required for two reasons:
@@ -367,56 +364,74 @@ impl<'a> ResolverExpand for Resolver<'a> {
         //   is applied, so they have to be produced by the container's expansion rather
         //   than by individual derives.
         // - Derives in the container need to know whether one of them is a built-in `Copy`.
-        // FIXME: Try to cache intermediate results to avoid resolving same derives multiple times.
+        // Temporarily take the data to avoid borrow checker conflicts.
+        let mut derive_data = mem::take(&mut self.derive_data);
+        let entry = derive_data.entry(expn_id).or_insert_with(|| DeriveData {
+            resolutions: derive_paths(),
+            helper_attrs: Vec::new(),
+            has_derive_copy: false,
+        });
         let parent_scope = self.invocation_parent_scopes[&expn_id];
-        let mut exts = Vec::new();
-        let mut helper_attrs = Vec::new();
-        let mut has_derive_copy = false;
-        for path in derives {
-            exts.push((
-                match self.resolve_macro_path(
-                    &path,
-                    Some(MacroKind::Derive),
-                    &parent_scope,
-                    true,
-                    force,
-                ) {
-                    Ok((Some(ext), _)) => {
-                        let span =
-                            path.segments.last().unwrap().ident.span.normalize_to_macros_2_0();
-                        helper_attrs
-                            .extend(ext.helper_attrs.iter().map(|name| Ident::new(*name, span)));
-                        has_derive_copy |= ext.builtin_name == Some(sym::Copy);
-                        ext
-                    }
-                    Ok(_) | Err(Determinacy::Determined) => self.dummy_ext(MacroKind::Derive),
-                    Err(Determinacy::Undetermined) => return Err(Indeterminate),
-                },
-                path,
-            ))
+        for (i, (path, _, opt_ext)) in entry.resolutions.iter_mut().enumerate() {
+            if opt_ext.is_none() {
+                *opt_ext = Some(
+                    match self.resolve_macro_path(
+                        &path,
+                        Some(MacroKind::Derive),
+                        &parent_scope,
+                        true,
+                        force,
+                    ) {
+                        Ok((Some(ext), _)) => {
+                            if !ext.helper_attrs.is_empty() {
+                                let last_seg = path.segments.last().unwrap();
+                                let span = last_seg.ident.span.normalize_to_macros_2_0();
+                                entry.helper_attrs.extend(
+                                    ext.helper_attrs
+                                        .iter()
+                                        .map(|name| (i, Ident::new(*name, span))),
+                                );
+                            }
+                            entry.has_derive_copy |= ext.builtin_name == Some(sym::Copy);
+                            ext
+                        }
+                        Ok(_) | Err(Determinacy::Determined) => self.dummy_ext(MacroKind::Derive),
+                        Err(Determinacy::Undetermined) => {
+                            assert!(self.derive_data.is_empty());
+                            self.derive_data = derive_data;
+                            return Err(Indeterminate);
+                        }
+                    },
+                );
+            }
         }
-        self.derive_resolutions.insert(expn_id, exts);
-        self.helper_attrs.insert(expn_id, helper_attrs);
+        // Sort helpers in a stable way independent from the derive resolution order.
+        entry.helper_attrs.sort_by_key(|(i, _)| *i);
+        self.helper_attrs
+            .insert(expn_id, entry.helper_attrs.iter().map(|(_, ident)| *ident).collect());
         // Mark this derive as having `Copy` either if it has `Copy` itself or if its parent derive
         // has `Copy`, to support cases like `#[derive(Clone, Copy)] #[derive(Debug)]`.
-        if has_derive_copy || self.has_derive_copy(parent_scope.expansion) {
+        if entry.has_derive_copy || self.has_derive_copy(parent_scope.expansion) {
             self.containers_deriving_copy.insert(expn_id);
         }
+        assert!(self.derive_data.is_empty());
+        self.derive_data = derive_data;
         Ok(())
     }
 
-    fn take_derive_resolutions(
-        &mut self,
-        expn_id: ExpnId,
-    ) -> Option<Vec<(Lrc<SyntaxExtension>, ast::Path)>> {
-        self.derive_resolutions.remove(&expn_id)
+    fn take_derive_resolutions(&mut self, expn_id: LocalExpnId) -> Option<DeriveResolutions> {
+        self.derive_data.remove(&expn_id).map(|data| data.resolutions)
     }
 
     // The function that implements the resolution logic of `#[cfg_accessible(path)]`.
     // Returns true if the path can certainly be resolved in one of three namespaces,
     // returns false if the path certainly cannot be resolved in any of the three namespaces.
     // Returns `Indeterminate` if we cannot give a certain answer yet.
-    fn cfg_accessible(&mut self, expn_id: ExpnId, path: &ast::Path) -> Result<bool, Indeterminate> {
+    fn cfg_accessible(
+        &mut self,
+        expn_id: LocalExpnId,
+        path: &ast::Path,
+    ) -> Result<bool, Indeterminate> {
         let span = path.span;
         let path = &Segment::from_path(path);
         let parent_scope = self.invocation_parent_scopes[&expn_id];
@@ -447,6 +462,10 @@ impl<'a> ResolverExpand for Resolver<'a> {
             .emit();
         Ok(false)
     }
+
+    fn get_proc_macro_quoted_span(&self, krate: CrateNum, id: usize) -> Span {
+        self.crate_loader.cstore().get_proc_macro_quoted_span_untracked(krate, id, self.session)
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -457,7 +476,7 @@ impl<'a> Resolver<'a> {
         &mut self,
         path: &ast::Path,
         kind: MacroKind,
-        require_inert: bool,
+        supports_macro_expansion: SupportsMacroExpansion,
         inner_attr: bool,
         parent_scope: &ParentScope<'a>,
         node_id: NodeId,
@@ -505,8 +524,17 @@ impl<'a> Resolver<'a> {
 
         let unexpected_res = if ext.macro_kind() != kind {
             Some((kind.article(), kind.descr_expected()))
-        } else if require_inert && matches!(res, Res::Def(..)) {
-            Some(("a", "non-macro attribute"))
+        } else if matches!(res, Res::Def(..)) {
+            match supports_macro_expansion {
+                SupportsMacroExpansion::No => Some(("a", "non-macro attribute")),
+                SupportsMacroExpansion::Yes { supports_inner_attrs } => {
+                    if inner_attr && !supports_inner_attrs {
+                        Some(("a", "non-macro inner attribute"))
+                    } else {
+                        None
+                    }
+                }
+            }
         } else {
             None
         };
@@ -633,7 +661,7 @@ impl<'a> Resolver<'a> {
     crate fn early_resolve_ident_in_lexical_scope(
         &mut self,
         orig_ident: Ident,
-        scope_set: ScopeSet,
+        scope_set: ScopeSet<'a>,
         parent_scope: &ParentScope<'a>,
         record_used: bool,
         force: bool,
@@ -660,6 +688,7 @@ impl<'a> Resolver<'a> {
             ScopeSet::All(ns, is_import) => (ns, None, is_import),
             ScopeSet::AbsolutePath(ns) => (ns, None, false),
             ScopeSet::Macro(macro_kind) => (MacroNS, Some(macro_kind), false),
+            ScopeSet::Late(ns, ..) => (ns, None, false),
         };
 
         // This is *the* result, resolution from the scope closest to the resolved identifier.
@@ -685,7 +714,8 @@ impl<'a> Resolver<'a> {
                 let ident = Ident::new(orig_ident.name, orig_ident.span.with_ctxt(ctxt));
                 let ok = |res, span, arenas| {
                     Ok((
-                        (res, ty::Visibility::Public, span, ExpnId::root()).to_name_binding(arenas),
+                        (res, ty::Visibility::Public, span, LocalExpnId::ROOT)
+                            .to_name_binding(arenas),
                         Flags::empty(),
                     ))
                 };
@@ -768,19 +798,34 @@ impl<'a> Resolver<'a> {
                             Err((Determinacy::Determined, _)) => Err(Determinacy::Determined),
                         }
                     }
-                    Scope::Module(module) => {
+                    Scope::Module(module, derive_fallback_lint_id) => {
                         let adjusted_parent_scope = &ParentScope { module, ..*parent_scope };
                         let binding = this.resolve_ident_in_module_unadjusted_ext(
                             ModuleOrUniformRoot::Module(module),
                             ident,
                             ns,
                             adjusted_parent_scope,
-                            true,
+                            !matches!(scope_set, ScopeSet::Late(..)),
                             record_used,
                             path_span,
                         );
                         match binding {
                             Ok(binding) => {
+                                if let Some(lint_id) = derive_fallback_lint_id {
+                                    this.lint_buffer.buffer_lint_with_diagnostic(
+                                        PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
+                                        lint_id,
+                                        orig_ident.span,
+                                        &format!(
+                                            "cannot find {} `{}` in this scope",
+                                            ns.descr(),
+                                            ident
+                                        ),
+                                        BuiltinLintDiagnostics::ProcMacroDeriveResolutionFallback(
+                                            orig_ident.span,
+                                        ),
+                                    );
+                                }
                                 let misc_flags = if ptr::eq(module, this.graph_root) {
                                     Flags::MISC_SUGGEST_CRATE
                                 } else if module.is_normal() {
@@ -864,7 +909,7 @@ impl<'a> Resolver<'a> {
                     Ok((binding, flags))
                         if sub_namespace_match(binding.macro_kind(), macro_kind) =>
                     {
-                        if !record_used {
+                        if !record_used || matches!(scope_set, ScopeSet::Late(..)) {
                             return Some(Ok(binding));
                         }
 
@@ -1052,9 +1097,13 @@ impl<'a> Resolver<'a> {
                     let seg = Segment::from_ident(ident);
                     check_consistency(self, &[seg], ident.span, kind, initial_res, res);
                     if res == Res::NonMacroAttr(NonMacroAttrKind::DeriveHelperCompat) {
+                        let node_id = self
+                            .invocation_parents
+                            .get(&parent_scope.expansion)
+                            .map_or(ast::CRATE_NODE_ID, |id| self.def_id_to_node_id[id.0]);
                         self.lint_buffer.buffer_lint_with_diagnostic(
                             LEGACY_DERIVE_HELPERS,
-                            self.lint_node_id(parent_scope.expansion),
+                            node_id,
                             ident.span,
                             "derive helper attribute is used before it is introduced",
                             BuiltinLintDiagnostics::LegacyDeriveHelpers(binding.span),

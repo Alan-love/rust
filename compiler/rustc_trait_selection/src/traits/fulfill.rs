@@ -3,9 +3,10 @@ use rustc_data_structures::obligation_forest::ProcessResult;
 use rustc_data_structures::obligation_forest::{Error, ForestObligation, Outcome};
 use rustc_data_structures::obligation_forest::{ObligationForest, ObligationProcessor};
 use rustc_errors::ErrorReported;
-use rustc_infer::traits::{TraitEngine, TraitEngineExt as _, TraitObligation};
+use rustc_infer::traits::{SelectionError, TraitEngine, TraitEngineExt as _, TraitObligation};
+use rustc_middle::mir::abstract_const::NotConstEvaluatable;
 use rustc_middle::mir::interpret::ErrorHandled;
-use rustc_middle::ty::error::ExpectedFound;
+use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::ToPredicate;
 use rustc_middle::ty::{self, Binder, Const, Ty, TypeFoldable};
@@ -18,7 +19,7 @@ use super::wf;
 use super::CodeAmbiguity;
 use super::CodeProjectionError;
 use super::CodeSelectionError;
-use super::{ConstEvalFailure, Unimplemented};
+use super::Unimplemented;
 use super::{FulfillmentError, FulfillmentErrorCode};
 use super::{ObligationCause, PredicateObligation};
 
@@ -166,6 +167,7 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentContext<'tcx> {
     /// `SomeTrait` or a where-clause that lets us unify `$0` with
     /// something concrete. If this fails, we'll unify `$0` with
     /// `projection_ty` again.
+    #[tracing::instrument(level = "debug", skip(self, infcx, param_env, cause))]
     fn normalize_projection_type(
         &mut self,
         infcx: &InferCtxt<'_, 'tcx>,
@@ -173,8 +175,6 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentContext<'tcx> {
         projection_ty: ty::ProjectionTy<'tcx>,
         cause: ObligationCause<'tcx>,
     ) -> Ty<'tcx> {
-        debug!(?projection_ty, "normalize_projection_type");
-
         debug_assert!(!projection_ty.has_escaping_bound_vars());
 
         // FIXME(#20304) -- cache
@@ -365,6 +365,7 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
                     let project_obligation = obligation.with(binder.rebind(data));
 
                     self.process_projection_obligation(
+                        obligation,
                         project_obligation,
                         &mut pending_obligation.stalled_on,
                     )
@@ -419,6 +420,7 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
                     let project_obligation = obligation.with(Binder::dummy(*data));
 
                     self.process_projection_obligation(
+                        obligation,
                         project_obligation,
                         &mut pending_obligation.stalled_on,
                     )
@@ -498,14 +500,19 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
                         obligation.cause.span,
                     ) {
                         Ok(()) => ProcessResult::Changed(vec![]),
-                        Err(ErrorHandled::TooGeneric) => {
+                        Err(NotConstEvaluatable::MentionsInfer) => {
                             pending_obligation.stalled_on.clear();
                             pending_obligation.stalled_on.extend(
                                 substs.iter().filter_map(TyOrConstInferVar::maybe_from_generic_arg),
                             );
                             ProcessResult::Unchanged
                         }
-                        Err(e) => ProcessResult::Error(CodeSelectionError(ConstEvalFailure(e))),
+                        Err(
+                            e @ NotConstEvaluatable::MentionsParam
+                            | e @ NotConstEvaluatable::Error(_),
+                        ) => ProcessResult::Error(CodeSelectionError(
+                            SelectionError::NotConstEvaluatable(e),
+                        )),
                     }
                 }
 
@@ -516,15 +523,13 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
                         // if the constants depend on generic parameters.
                         //
                         // Let's just see where this breaks :shrug:
-                        if let (
-                            ty::ConstKind::Unevaluated(a_def, a_substs, None),
-                            ty::ConstKind::Unevaluated(b_def, b_substs, None),
-                        ) = (c1.val, c2.val)
+                        if let (ty::ConstKind::Unevaluated(a), ty::ConstKind::Unevaluated(b)) =
+                            (c1.val, c2.val)
                         {
                             if self
                                 .selcx
                                 .tcx()
-                                .try_unify_abstract_consts(((a_def, a_substs), (b_def, b_substs)))
+                                .try_unify_abstract_consts(((a.def, a.substs), (b.def, b.substs)))
                             {
                                 return ProcessResult::Changed(vec![]);
                             }
@@ -534,18 +539,17 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
                     let stalled_on = &mut pending_obligation.stalled_on;
 
                     let mut evaluate = |c: &'tcx Const<'tcx>| {
-                        if let ty::ConstKind::Unevaluated(def, substs, promoted) = c.val {
+                        if let ty::ConstKind::Unevaluated(unevaluated) = c.val {
                             match self.selcx.infcx().const_eval_resolve(
                                 obligation.param_env,
-                                def,
-                                substs,
-                                promoted,
+                                unevaluated,
                                 Some(obligation.cause.span),
                             ) {
                                 Ok(val) => Ok(Const::from_value(self.selcx.tcx(), val, c.ty)),
                                 Err(ErrorHandled::TooGeneric) => {
                                     stalled_on.extend(
-                                        substs
+                                        unevaluated
+                                            .substs
                                             .iter()
                                             .filter_map(TyOrConstInferVar::maybe_from_generic_arg),
                                     );
@@ -576,11 +580,11 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
                             }
                         }
                         (Err(ErrorHandled::Reported(ErrorReported)), _)
-                        | (_, Err(ErrorHandled::Reported(ErrorReported))) => {
-                            ProcessResult::Error(CodeSelectionError(ConstEvalFailure(
-                                ErrorHandled::Reported(ErrorReported),
-                            )))
-                        }
+                        | (_, Err(ErrorHandled::Reported(ErrorReported))) => ProcessResult::Error(
+                            CodeSelectionError(SelectionError::NotConstEvaluatable(
+                                NotConstEvaluatable::Error(ErrorReported),
+                            )),
+                        ),
                         (Err(ErrorHandled::Linted), _) | (_, Err(ErrorHandled::Linted)) => {
                             span_bug!(
                                 obligation.cause.span(self.selcx.tcx()),
@@ -588,7 +592,16 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
                             )
                         }
                         (Err(ErrorHandled::TooGeneric), _) | (_, Err(ErrorHandled::TooGeneric)) => {
-                            ProcessResult::Unchanged
+                            if c1.has_infer_types_or_consts() || c2.has_infer_types_or_consts() {
+                                ProcessResult::Unchanged
+                            } else {
+                                // Two different constants using generic parameters ~> error.
+                                let expected_found = ExpectedFound::new(true, c1, c2);
+                                ProcessResult::Error(FulfillmentErrorCode::CodeConstEquateError(
+                                    expected_found,
+                                    TypeError::ConstMismatch(expected_found),
+                                ))
+                            }
                         }
                     }
                 }
@@ -655,10 +668,22 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
 
     fn process_projection_obligation(
         &mut self,
+        obligation: &PredicateObligation<'tcx>,
         project_obligation: PolyProjectionObligation<'tcx>,
         stalled_on: &mut Vec<TyOrConstInferVar<'tcx>>,
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
         let tcx = self.selcx.tcx();
+
+        if obligation.predicate.is_global() {
+            // no type variables present, can use evaluation for better caching.
+            // FIXME: consider caching errors too.
+            if self.selcx.infcx().predicate_must_hold_considering_regions(obligation) {
+                return ProcessResult::Changed(vec![]);
+            } else {
+                tracing::debug!("Does NOT hold: {:?}", obligation);
+            }
+        }
+
         match project::poly_project_and_unify_type(self.selcx, &project_obligation) {
             Ok(Ok(Some(os))) => ProcessResult::Changed(mk_pending(os)),
             Ok(Ok(None)) => {
@@ -681,7 +706,7 @@ impl<'a, 'b, 'tcx> FulfillProcessor<'a, 'b, 'tcx> {
 /// Returns the set of inference variables contained in `substs`.
 fn substs_infer_vars<'a, 'tcx>(
     selcx: &mut SelectionContext<'a, 'tcx>,
-    substs: ty::Binder<SubstsRef<'tcx>>,
+    substs: ty::Binder<'tcx, SubstsRef<'tcx>>,
 ) -> impl Iterator<Item = TyOrConstInferVar<'tcx>> {
     selcx
         .infcx()
@@ -705,6 +730,10 @@ fn substs_infer_vars<'a, 'tcx>(
 fn to_fulfillment_error<'tcx>(
     error: Error<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>>,
 ) -> FulfillmentError<'tcx> {
-    let obligation = error.backtrace.into_iter().next().unwrap().obligation;
-    FulfillmentError::new(obligation, error.error)
+    let mut iter = error.backtrace.into_iter();
+    let obligation = iter.next().unwrap().obligation;
+    // The root obligation is the last item in the backtrace - if there's only
+    // one item, then it's the same as the main obligation
+    let root_obligation = iter.next_back().map_or_else(|| obligation.clone(), |e| e.obligation);
+    FulfillmentError::new(obligation, error.error, root_obligation)
 }
